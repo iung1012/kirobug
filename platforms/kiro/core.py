@@ -1109,13 +1109,15 @@ class KiroRegister:
             except Exception as e:
                 self.log(f"Debug UI failed: {e}")
 
+            self._accept_cookie_banner_if_present(page)
+
             if page.locator('button:has-text("Builder ID")').count() > 0:
                 page.click('button:has-text("Builder ID")')
             elif page.locator('text="AWS Builder ID"').count() > 0:
                 page.locator('text="AWS Builder ID"').first.click()
 
             self.log("等待跳转到 AWS SSO ...")
-            page.wait_for_url(re.compile(r"signin\.aws"), timeout=30000)
+            page.wait_for_url(re.compile(r"signin\.aws"), timeout=60000)
             self._accept_cookie_banner_if_present(page)
             self._solve_captcha_if_exists(page)
 
