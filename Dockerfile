@@ -20,7 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HOST=0.0.0.0 \
-    PORT=8000 \
+    PORT=3000 \
     APP_CONDA_ENV=docker \
     APP_RELOAD=0 \
     APP_RUNTIME_DIR=/runtime \
@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends dos2unix git ip
     && mkdir -p /runtime /runtime/logs /runtime/smstome_used /_ext_targets \
     && rm -rf /var/lib/apt/lists/*
 
-EXPOSE 8000 8889
+EXPOSE 3000 8889
 
 VOLUME ["/runtime", "/_ext_targets"]
 
