@@ -2974,10 +2974,35 @@ class LuckMailMailbox(BaseMailbox):
         **kwargs,
     ) -> str:
         if not self._use_purchase_mode(account):
-            self._log("[LuckMail] 等验证码分支: 订单接码")
+            self._log("[LuckMail] 等待验证码分支: 订单接码")
             order_no = account.account_id or self._order_no
             if not order_no:
                 raise RuntimeError("LuckMail 未创建订单，无法等待验证码")
+
+            # If the order is already cancelled/timed-out (expired before OTP step),
+            # recreate a fresh order for the same email using specified_email.
+            try:
+                probe = self._client.user._sync_get_order_code(order_no)
+                if probe.status in {"cancelled", "timeout"}:
+                    email_addr = (account.email if account else None) or self._email
+                    if email_addr and self._project_code:
+                        self._log(
+                            f"[LuckMail] 订单已过期，为原邮箱重新创建订单: {email_addr}"
+                        )
+                        body: dict = {
+                            "project_code": self._project_code,
+                            "specified_email": email_addr,
+                        }
+                        if self._email_type:
+                            body["email_type"] = self._email_type
+                        new_order = self._client.user._sync_create_order(body)
+                        order_no = new_order.order_no
+                        self._order_no = order_no
+                        self._log(
+                            f"[LuckMail] 新订单: {order_no}, 超时: {new_order.expired_at}"
+                        )
+            except Exception as probe_err:
+                self._log(f"[LuckMail] 订单探测失败，继续使用原订单: {probe_err}")
 
             def on_poll_order(result):
                 self._log(f"[LuckMail] 轮询中... 状态: {result.status}")

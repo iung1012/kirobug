@@ -698,7 +698,14 @@ class KiroRegister:
             return response.json()
 
         data = json.dumps(payload).encode("utf-8")
-        opener = build_opener()
+        if self.proxy:
+            import urllib.request as _urllib_request
+            proxy_handler = _urllib_request.ProxyHandler(
+                {"http": self.proxy, "https": self.proxy}
+            )
+            opener = build_opener(proxy_handler)
+        else:
+            opener = build_opener()
         request = Request(url, data=data, headers=headers, method="POST")
         with opener.open(request, timeout=30) as resp:
             body = resp.read().decode("utf-8")
