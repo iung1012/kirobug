@@ -29,7 +29,10 @@ try:
 except ImportError:
     cffi_requests: Any = None
 
-from playwright.sync_api import sync_playwright, TimeoutError, Page, Locator
+try:
+    from patchright.sync_api import sync_playwright, TimeoutError, Page, Locator
+except ImportError:
+    from playwright.sync_api import sync_playwright, TimeoutError, Page, Locator
 
 try:
     stealth_sync = importlib.import_module("playwright_stealth").stealth_sync
