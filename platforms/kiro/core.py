@@ -864,17 +864,41 @@ class KiroRegister:
             .rstrip("=")
         )
 
-        # Start callback server first so we know the port before registering the OIDC client.
-        # The registered redirectUri must match exactly what's used in the authorization URL.
-        callback_server = _DesktopAuthCallbackServer(expected_state=state)
-        callback_server.start()
-        client_registration = self._register_desktop_client(
-            region, redirect_uri=callback_server.redirect_uri
-        )
+        # Use a fixed redirect URI and intercept the navigation inside Playwright.
+        # This avoids relying on a local HTTP server that the browser may not reach in Docker.
+        redirect_uri = "http://127.0.0.1:19876/oauth/callback"
+        client_registration = self._register_desktop_client(region, redirect_uri=redirect_uri)
+
+        captured: dict = {}
+        capture_event = threading.Event()
+
+        def _handle_callback_route(route):
+            from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, unquote as _unquote
+            parsed = _urlparse(route.request.url)
+            params = _parse_qs(parsed.query)
+            error = params.get("error", [None])[0]
+            cb_state = params.get("state", [None])[0]
+            code = params.get("code", [None])[0]
+            if error:
+                captured["error"] = _unquote(
+                    params.get("error_description", [error])[0]
+                )
+            elif cb_state != state:
+                captured["error"] = "桌面授权回调 state 不匹配"
+            elif not code:
+                captured["error"] = "桌面授权回调缺少 code"
+            else:
+                captured["code"] = code
+            capture_event.set()
+            route.fulfill(
+                status=200,
+                content_type="text/html; charset=utf-8",
+                body="<html><body><h3>Kiro desktop authentication completed.</h3></body></html>",
+            )
+
         auth_page = None
         desktop_otp_used = False
         try:
-            redirect_uri = callback_server.redirect_uri
             authorize_url = (
                 f"https://oidc.{region}.amazonaws.com/authorize?"
                 + urlencode(
@@ -892,11 +916,12 @@ class KiroRegister:
 
             self.log("开始桌面端授权跳转 ...")
             auth_page = self._require_context().new_page()
+            auth_page.route("**127.0.0.1**/oauth/callback**", _handle_callback_route)
             auth_page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
 
             started = time.time()
             while time.time() - started < 120:
-                if callback_server._event.is_set():
+                if capture_event.is_set():
                     break
                 if otp_callback and not desktop_otp_used:
                     try:
@@ -920,13 +945,20 @@ class KiroRegister:
                 self._handle_desktop_auth_page(auth_page, email=email, pwd=pwd)
                 self._human_sleep(0.6, 1.3)
 
-            callback = callback_server.wait(timeout=5)
+            if not capture_event.wait(timeout=5):
+                raise TimeoutError("等待桌面授权回调超时")
+            if "error" in captured:
+                raise RuntimeError(captured["error"])
+            code = captured.get("code")
+            if not code:
+                raise RuntimeError("桌面授权回调缺少 code")
+
             desktop_token = self._exchange_desktop_token(
                 region=region,
                 client_id=client_registration["clientId"],
                 client_secret=client_registration["clientSecret"],
                 redirect_uri=redirect_uri,
-                code=callback["code"],
+                code=code,
                 code_verifier=code_verifier,
             )
 
@@ -944,7 +976,6 @@ class KiroRegister:
                     auth_page.close()
                 except Exception:
                     pass
-            callback_server.close()
 
     def fetch_desktop_tokens(
         self, email: str, pwd: str, otp_callback=None
