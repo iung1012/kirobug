@@ -745,7 +745,7 @@ class KiroRegister:
             except Exception:
                 pass
 
-    def _register_desktop_client(self, region: str) -> dict:
+    def _register_desktop_client(self, region: str, redirect_uri: str = "") -> dict:
         self.log("开始注册桌面端 OIDC Client ...")
         response = self._http_post_json(
             f"https://oidc.{region}.amazonaws.com/client/register",
@@ -754,7 +754,7 @@ class KiroRegister:
                 "clientType": "public",
                 "scopes": KIRO_IDC_SCOPES,
                 "grantTypes": ["authorization_code", "refresh_token"],
-                "redirectUris": ["http://127.0.0.1/oauth/callback"],
+                "redirectUris": [redirect_uri or "http://127.0.0.1/oauth/callback"],
                 "issuerUrl": KIRO_IDC_START_URL,
             },
         )
@@ -851,7 +851,6 @@ class KiroRegister:
         self, email: str = "", pwd: str = "", otp_callback=None
     ) -> dict:
         region = KIRO_IDC_REGION
-        client_registration = self._register_desktop_client(region)
         state = str(uuid.uuid4())
         code_verifier = uuid.uuid4().hex + uuid.uuid4().hex
         code_challenge = (
@@ -862,8 +861,13 @@ class KiroRegister:
             .rstrip("=")
         )
 
+        # Start callback server first so we know the port before registering the OIDC client.
+        # The registered redirectUri must match exactly what's used in the authorization URL.
         callback_server = _DesktopAuthCallbackServer(expected_state=state)
         callback_server.start()
+        client_registration = self._register_desktop_client(
+            region, redirect_uri=callback_server.redirect_uri
+        )
         auth_page = None
         desktop_otp_used = False
         try:
