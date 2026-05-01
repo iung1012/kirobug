@@ -878,32 +878,56 @@ class KiroRegister:
             .rstrip("=")
         )
 
-        # Use a fixed redirect URI and intercept the navigation inside Playwright.
-        # This avoids relying on a local HTTP server that the browser may not reach in Docker.
-        redirect_uri = "http://127.0.0.1:19876/oauth/callback"
+        # Start a real local HTTP server for the OAuth callback.
+        # Three capture paths run in parallel so we catch the redirect regardless
+        # of how the headless browser handles the localhost navigation:
+        #   1. _DesktopAuthCallbackServer  – browser connects to real server
+        #   2. context.on("request")       – fires at CDP level before TCP
+        #   3. context.route()             – intercepts + fulfills the request
+        callback_server = _DesktopAuthCallbackServer(expected_state=state)
+        callback_server.start()
+        redirect_uri = callback_server.redirect_uri
+        self.log(f"回调服务已启动: {redirect_uri}")
+
         client_registration = self._register_desktop_client(region, redirect_uri=redirect_uri)
 
         captured: dict = {}
         capture_event = threading.Event()
 
+        def _capture_from_url(url: str):
+            if capture_event.is_set():
+                return
+            try:
+                parsed_u = urlparse(url)
+                params_u = parse_qs(parsed_u.query)
+                if not params_u:
+                    params_u = parse_qs(parsed_u.fragment)
+                error_u = (params_u.get("error") or [None])[0]
+                cb_state = (params_u.get("state") or [None])[0]
+                code_u = (params_u.get("code") or [None])[0]
+                if error_u:
+                    from urllib.parse import unquote as _unquote
+                    captured["error"] = _unquote(
+                        (params_u.get("error_description") or [error_u])[0]
+                    )
+                elif cb_state != state:
+                    captured["error"] = "桌面授权回调 state 不匹配"
+                elif not code_u:
+                    return  # not the callback URL yet
+                else:
+                    captured["code"] = code_u
+                capture_event.set()
+            except Exception:
+                pass
+
+        def _on_ctx_request(request):
+            url = request.url
+            if "127.0.0.1" in url and "oauth/callback" in url:
+                self.log(f"[request事件] 捕获回调URL: {url[:120]}")
+                _capture_from_url(url)
+
         def _handle_callback_route(route):
-            from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, unquote as _unquote
-            parsed = _urlparse(route.request.url)
-            params = _parse_qs(parsed.query)
-            error = params.get("error", [None])[0]
-            cb_state = params.get("state", [None])[0]
-            code = params.get("code", [None])[0]
-            if error:
-                captured["error"] = _unquote(
-                    params.get("error_description", [error])[0]
-                )
-            elif cb_state != state:
-                captured["error"] = "桌面授权回调 state 不匹配"
-            elif not code:
-                captured["error"] = "桌面授权回调缺少 code"
-            else:
-                captured["code"] = code
-            capture_event.set()
+            _capture_from_url(route.request.url)
             route.fulfill(
                 status=200,
                 content_type="text/html; charset=utf-8",
@@ -912,7 +936,12 @@ class KiroRegister:
 
         auth_page = None
         desktop_otp_used = False
+        ctx = self._require_context()
+        _callback_pattern = re.compile(r"http://127\.0\.0\.1[^/]*/oauth/callback")
         try:
+            ctx.on("request", _on_ctx_request)
+            ctx.route(_callback_pattern, _handle_callback_route)
+
             authorize_url = (
                 f"https://oidc.{region}.amazonaws.com/authorize?"
                 + urlencode(
@@ -929,23 +958,23 @@ class KiroRegister:
             )
 
             self.log("开始桌面端授权跳转 ...")
-            ctx = self._require_context()
-            # Register on the context (not just auth_page) so the callback is caught
-            # even if AWS opens it in a new window / popup.
-            _callback_pattern = re.compile(r"http://127\.0\.0\.1:\d+/oauth/callback")
-            ctx.route(_callback_pattern, _handle_callback_route)
             auth_page = ctx.new_page()
             auth_page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
 
             started = time.time()
             allow_clicked = False
             while time.time() - started < 120:
+                # Check all three capture paths
                 if capture_event.is_set():
                     break
-                if allow_clicked:
-                    # Already clicked Allow — just wait, don't interfere with the redirect
-                    time.sleep(1)
-                    continue
+                if callback_server._event.is_set():
+                    if callback_server.result:
+                        captured["code"] = callback_server.result["code"]
+                    elif callback_server.error:
+                        captured["error"] = callback_server.error
+                    capture_event.set()
+                    break
+
                 if otp_callback and not desktop_otp_used:
                     try:
                         otp_input = auth_page.locator(
@@ -965,16 +994,28 @@ class KiroRegister:
                         raise RuntimeError(
                             f"桌面授权验证码处理失败: {otp_error}"
                         ) from otp_error
-                if self._handle_desktop_auth_page(auth_page, email=email, pwd=pwd):
-                    allow_clicked = True
-                self._human_sleep(0.6, 1.3)
+
+                if not allow_clicked:
+                    if self._handle_desktop_auth_page(auth_page, email=email, pwd=pwd):
+                        allow_clicked = True
+                        # Log current URL to help diagnose redirect issues
+                        try:
+                            self.log(f"Allow后当前页面URL: {auth_page.url[:120]}")
+                        except Exception:
+                            pass
+                # Use a short Playwright-friendly sleep so events keep processing
+                self._human_sleep(0.5, 0.9)
 
             try:
                 ctx.unroute(_callback_pattern, _handle_callback_route)
             except Exception:
                 pass
+            try:
+                ctx.remove_listener("request", _on_ctx_request)
+            except Exception:
+                pass
 
-            if not capture_event.wait(timeout=5):
+            if not capture_event.is_set():
                 raise TimeoutError("等待桌面授权回调超时")
             if "error" in captured:
                 raise RuntimeError(captured["error"])
@@ -1000,6 +1041,7 @@ class KiroRegister:
                 "region": region,
             }
         finally:
+            callback_server.close()
             if auth_page:
                 try:
                     auth_page.close()
