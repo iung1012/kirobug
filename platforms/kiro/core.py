@@ -172,10 +172,11 @@ class _DesktopAuthCallbackServer:
 
 
 class KiroRegister:
-    def __init__(self, proxy=None, tag="KIRO", headless=False):
+    def __init__(self, proxy=None, tag="KIRO", headless=False, channel=None):
         self.proxy = proxy
         self.tag = tag
         self.headless = headless
+        self.channel = channel
         self.log_fn = print
         self.pw = None
         self.browser = None
@@ -247,9 +248,14 @@ class KiroRegister:
                 "--no-sandbox",
             ],
         }
+        if self.channel:
+            launch_opts["channel"] = self.channel
         if self.proxy:
             proxy_cfg = build_playwright_proxy_config(self.proxy)
             if proxy_cfg:
+                # Always bypass localhost so the desktop OAuth callback redirect
+                # is not routed through the external proxy (which would 403 it).
+                proxy_cfg["bypass"] = "127.0.0.1,localhost"
                 launch_opts["proxy"] = proxy_cfg
 
         self.browser = self.pw.chromium.launch(**launch_opts)
@@ -916,7 +922,7 @@ class KiroRegister:
 
             self.log("开始桌面端授权跳转 ...")
             auth_page = self._require_context().new_page()
-            auth_page.route("**127.0.0.1**/oauth/callback**", _handle_callback_route)
+            auth_page.route(re.compile(r"http://127\.0\.0\.1:\d+/oauth/callback"), _handle_callback_route)
             auth_page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
 
             started = time.time()
@@ -1154,9 +1160,7 @@ class KiroRegister:
             # 6. 等待返回 Kiro 拿 Token
             self.log("等待回到 Kiro...")
             try:
-                # 至少等它请求完 CompleteLogin
                 page.wait_for_url(re.compile(r"kiro\.dev"), timeout=30000)
-                self._human_sleep(3.0, 5.8)
             except TimeoutError:
                 pass
 
@@ -1187,7 +1191,14 @@ class KiroRegister:
 
                 return False, {"error": f"Failed to return to kiro.dev - {err_text}"}
 
-            self._capture_kiro_web_tokens(page)
+            # Poll until the SPA finishes the OAuth code exchange and stores the token.
+            # The React app needs a few seconds to exchange the code and write to storage.
+            token_deadline = time.time() + 30
+            while time.time() < token_deadline:
+                self._capture_kiro_web_tokens(page)
+                if self._captured_tokens.get("webAccessToken"):
+                    break
+                time.sleep(0.8)
 
             # 为了后续刷新等，必须有 token
             if not self._captured_tokens.get("webAccessToken"):
