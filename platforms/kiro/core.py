@@ -859,9 +859,10 @@ class KiroRegister:
                     self.log(f"桌面授权页点击 {label} ...")
                     button.click(timeout=2000)
                     self._human_sleep(0.6, 1.2)
-                    break
+                    return True
             except Exception:
                 continue
+        return False
 
     def _complete_desktop_idc_flow(
         self, email: str = "", pwd: str = "", otp_callback=None
@@ -928,14 +929,23 @@ class KiroRegister:
             )
 
             self.log("开始桌面端授权跳转 ...")
-            auth_page = self._require_context().new_page()
-            auth_page.route(re.compile(r"http://127\.0\.0\.1:\d+/oauth/callback"), _handle_callback_route)
+            ctx = self._require_context()
+            # Register on the context (not just auth_page) so the callback is caught
+            # even if AWS opens it in a new window / popup.
+            _callback_pattern = re.compile(r"http://127\.0\.0\.1:\d+/oauth/callback")
+            ctx.route(_callback_pattern, _handle_callback_route)
+            auth_page = ctx.new_page()
             auth_page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
 
             started = time.time()
+            allow_clicked = False
             while time.time() - started < 120:
                 if capture_event.is_set():
                     break
+                if allow_clicked:
+                    # Already clicked Allow — just wait, don't interfere with the redirect
+                    time.sleep(1)
+                    continue
                 if otp_callback and not desktop_otp_used:
                     try:
                         otp_input = auth_page.locator(
@@ -955,8 +965,14 @@ class KiroRegister:
                         raise RuntimeError(
                             f"桌面授权验证码处理失败: {otp_error}"
                         ) from otp_error
-                self._handle_desktop_auth_page(auth_page, email=email, pwd=pwd)
+                if self._handle_desktop_auth_page(auth_page, email=email, pwd=pwd):
+                    allow_clicked = True
                 self._human_sleep(0.6, 1.3)
+
+            try:
+                ctx.unroute(_callback_pattern, _handle_callback_route)
+            except Exception:
+                pass
 
             if not capture_event.wait(timeout=5):
                 raise TimeoutError("等待桌面授权回调超时")
